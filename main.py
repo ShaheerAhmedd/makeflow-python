@@ -391,8 +391,9 @@ def health():
 # Test SMTP in isolation
 @app.post("/test_reject")
 async def test_reject(to: str):
-    ok, dbg = send_reject_email(to)
-    return {"email_sent": ok, "email_debug": dbg}
+    sent = send_reject_email(to)
+    return {"to": to, "sent": bool(sent)}
+
 
 @app.post("/webhook")
 async def webhook(req: Request, x_forms_secret: Optional[str] = Header(None)):
