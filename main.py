@@ -70,42 +70,38 @@ Env vars needed (Render → Environment):
   OPENAI_API_KEY                     # fallback
 """
 
-import os
-import re
-import json
-import smtplib
+import os, re, json, smtplib
 from typing import Optional, Dict, Any, List, Tuple
-
 import httpx
 from email.mime.text import MIMEText
 from fastapi import FastAPI, Request, Header, HTTPException
 
+# ───────────────────────────────────────────────────────────────────────────────
+# ENV / CONFIG
+# ───────────────────────────────────────────────────────────────────────────────
 
-# =============================
-# Environment / Config
-# =============================
 FORMS_SHARED_SECRET = os.getenv("FORMS_SHARED_SECRET", "forms-shared-secret-123")
 
-# Gemini (Google Generative Language API)
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+# Gemini (optional but recommended)
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 # Monday.com
 MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN", "")
-MONDAY_BOARD_ID = os.getenv("MONDAY_BOARD_ID", "")
+MONDAY_BOARD_ID  = os.getenv("MONDAY_BOARD_ID", "")
 MONDAY_GROUP_NEW = os.getenv("MONDAY_GROUP_NEW", "topics")
 
-# Column IDs
-COL_EMAIL = os.getenv("MONDAY_COLUMN_EMAIL", "")
-COL_CATEGORY = os.getenv("MONDAY_COLUMN_CATEGORY", "")
-COL_PRIORITY = os.getenv("MONDAY_COLUMN_PRIORITY", "")
-COL_DESCRIPTION = os.getenv("MONDAY_COLUMN_DESCRIPTION", "")
-COL_ATTACHMENTS = os.getenv("MONDAY_COLUMN_ATTACHMENTS", "")
-COL_LINK_LONGTXT = os.getenv("MONDAY_COLUMN_LINK_LONGTEXT", "")
+COL_EMAIL        = os.getenv("MONDAY_COLUMN_EMAIL", "")            # e.g. email_mkw892yz
+COL_CATEGORY     = os.getenv("MONDAY_COLUMN_CATEGORY", "")         # e.g. color_mkvx44c
+COL_PRIORITY     = os.getenv("MONDAY_COLUMN_PRIORITY", "")         # e.g. color_mkvten2j
+COL_DESCRIPTION  = os.getenv("MONDAY_COLUMN_DESCRIPTION", "")      # e.g. text_mkvtqe4a
+COL_ATTACHMENTS  = os.getenv("MONDAY_COLUMN_ATTACHMENTS", "")      # e.g. text_mkw4tamw
+COL_LINK_LONGTXT = os.getenv("MONDAY_COLUMN_LINK_LONGTEXT", "")    # e.g. long_text_mkw5c6jg
 
 if not MONDAY_API_TOKEN or not MONDAY_BOARD_ID:
     raise RuntimeError("Set MONDAY_API_TOKEN and MONDAY_BOARD_ID")
 
+# Validations
 VALID_CATEGORIES = {
     "CRM", "AMMINISTRAZIONE", "CONSOLE", "OPERATIONS (Cambi asseganzione, etc.)"
 }
@@ -117,20 +113,17 @@ SMTP_PORT_REJECT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER_REJECT = os.getenv("SMTP_USER_REJECT", "")
 SMTP_PASS_REJECT = os.getenv("SMTP_PASS_REJECT", "")
 REJECT_FROM_NAME = os.getenv("REJECT_FROM_NAME", "Team IT")
-REJECT_SUBJECT = os.getenv(
-    "REJECT_SUBJECT",
-    "Ticket non aperto - Informazioni insufficienti",
-)
-FORM_URL = os.getenv("FORM_URL", "https://shorturl.at/2Mqxc")
-REJECT_LOGO_URL = os.getenv(
+REJECT_SUBJECT   = os.getenv("REJECT_SUBJECT", "Ticket non aperto – Informazioni insufficienti")
+FORM_URL         = os.getenv("FORM_URL", "https://shorturl.at/2Mqxc")
+REJECT_LOGO_URL  = os.getenv(
     "REJECT_LOGO_URL",
-    "https://prestiti.aessefin.it/wp-content/uploads/2024/11/aessefin_nuovo_logo2-removebg-preview.png",
+    "https://prestiti.aessefin.it/wp-content/uploads/2024/11/aessefin_nuovo_logo2-removebg-preview.png"
 )
 
+# ───────────────────────────────────────────────────────────────────────────────
+# PROMPT (same logic you had in Make.com)
+# ───────────────────────────────────────────────────────────────────────────────
 
-# =============================
-# Make.com Prompt (system)
-# =============================
 PROMPT_SYSTEM = (
     'You are "Ticket Verificator Bot". You evaluate Google Form responses to decide if they can '
     'become tickets in Monday.com.\n\n'
@@ -150,10 +143,10 @@ PROMPT_SYSTEM = (
     "   - Collect only Google Drive file links in `Allegati` (array).\n"
     "   - Copy the exact “Link of the record”.\n"
     "   - Build the `Email` object.\n"
-    '   - Set next_action = "create" AND router_decision = "create".\n'
+    "   - Set next_action = \"create\" AND router_decision = \"create\".\n"
     "   - Populate ALL fields in monday_fields.\n"
     "4) If rejected (Ticket is REJECTED):\n"
-    '   - Set next_action = "ask_clarify" AND router_decision = "ask_clarify".\n'
+    "   - Set next_action = \"ask_clarify\" AND router_decision = \"ask_clarify\".\n"
     "   - Do NOT populate monday_fields beyond placeholders.\n\n"
     "Rules: Reply ONLY valid JSON, no code fences. Do not invent data.\n\n"
     "OUTPUT JSON:\n"
@@ -175,12 +168,12 @@ PROMPT_SYSTEM = (
     "}\n"
 )
 
+# ───────────────────────────────────────────────────────────────────────────────
+# HELPERS (title, filters, etc.)
+# ───────────────────────────────────────────────────────────────────────────────
 
-# =============================
-# Helper functions
-# =============================
 def strip_any_leading_category(text: str) -> str:
-    """Remove any leading category prefix like 'CRM:' from a string."""
+    """Remove an initial category + punctuation if present."""
     if not text:
         return text
     cats = [
@@ -192,53 +185,53 @@ def strip_any_leading_category(text: str) -> str:
     pattern = rf"^\s*(?:{'|'.join(cats)})\s*[:\-–—]?\s*"
     return re.sub(pattern, "", text.strip(), flags=re.IGNORECASE).strip()
 
+def build_title_with_category(category: str, candidate: str, max_len: int = 30) -> str:
+    """
+    Prepend exactly one category tag → "CRM: <title>".
+    Ensures we don't end up with "CRM: CRM: …".
+    """
+    core = strip_any_leading_category(candidate) or "Ticket"
+    clean = f"{category}: {core}"
+    return clean if len(clean) <= max_len else clean[: max_len - 1] + "…"
 
 def first_sentence(text: str) -> str:
-    """First sentence (or whole string) without a leading category; fallback to 'Ticket'."""
     if not text:
         return "Ticket"
     clean = strip_any_leading_category(text)
     sent = re.split(r"[.!?\n]", clean, maxsplit=1)[0].strip()
     return sent or "Ticket"
 
-
 def filter_drive_links(urls: List[str]) -> List[str]:
-    """Only Google Drive/Docs links for the Allegati field."""
     out = []
     for u in urls or []:
         if isinstance(u, str) and ("drive.google.com" in u or "docs.google.com" in u):
             out.append(u)
     return out
 
+# ───────────────────────────────────────────────────────────────────────────────
+# REJECTION EMAIL (with TLS/SSL fallback + diagnostics)
+# ───────────────────────────────────────────────────────────────────────────────
 
-# =============================
-# Rejection email (HTML)
-# =============================
-def send_reject_email(to_email: str) -> bool:
+def send_reject_email(to_email: str) -> Tuple[bool, str]:
     """
     Send the exact rejection email using the dedicated mailbox.
+    Returns (ok, debug_message).
     """
     if not (SMTP_USER_REJECT and SMTP_PASS_REJECT and to_email):
-        return False
+        return False, "Missing SMTP_USER_REJECT / SMTP_PASS_REJECT / recipient"
 
     html = f"""<!doctype html>
 <html>
   <body style="font-family:Arial,Helvetica,sans-serif; color:#222; line-height:1.5;">
     <p>Ciao,</p>
-
     <p>abbiamo ricevuto la tua richiesta tramite il modulo di apertura 📥</p>
-
     <p>Purtroppo, non è stato possibile procedere con l’apertura del ticket in quanto
-       non sono state fornite informazioni sufficienti nei seguenti campi:<br/>
-       Ti invitiamo a compilare nuovamente il modulo in modo completo, specificando nel
-       dettaglio il problema e la priorità.</p>
-
+       non sono state fornite informazioni sufficienti nei seguenti campi.
+       Ti invitiamo a compilare nuovamente il modulo in modo completo,
+       specificando nel dettaglio il problema e la priorità.</p>
     <p>Puoi accedere al modulo tramite questo link:
        <a href="{FORM_URL}" target="_blank">{FORM_URL}</a> ✍️</p>
-
-    <p>Cordiali saluti,<br/>
-       {REJECT_FROM_NAME}</p>
-
+    <p>Cordiali saluti,<br/>{REJECT_FROM_NAME}</p>
     <img src="{REJECT_LOGO_URL}" alt="Company Logo"
          style="width:150px; height:auto; display:block; margin-top:20px;" />
   </body>
@@ -246,24 +239,44 @@ def send_reject_email(to_email: str) -> bool:
 
     msg = MIMEText(html, "html", "utf-8")
     msg["Subject"] = REJECT_SUBJECT
-    msg["From"] = f"{REJECT_FROM_NAME} <{SMTP_USER_REJECT}>"
-    msg["To"] = to_email
+    msg["From"]    = f"{REJECT_FROM_NAME} <{SMTP_USER_REJECT}>"
+    msg["To"]      = to_email
 
+    debug = []
+
+    # Try STARTTLS 587
     try:
-        with smtplib.SMTP(SMTP_HOST_REJECT, SMTP_PORT_REJECT) as s:
+        debug.append(f"Connecting {SMTP_HOST_REJECT}:{SMTP_PORT_REJECT} STARTTLS")
+        with smtplib.SMTP(SMTP_HOST_REJECT, SMTP_PORT_REJECT, timeout=20) as s:
+            s.set_debuglevel(1)  # prints to server logs
+            s.ehlo()
             s.starttls()
+            s.ehlo()
             s.login(SMTP_USER_REJECT, SMTP_PASS_REJECT)
             s.sendmail(SMTP_USER_REJECT, [to_email], msg.as_string())
-        return True
-    except Exception:
-        return False
+        return True, "sent via STARTTLS:587"
+    except Exception as e1:
+        debug.append(f"STARTTLS failed: {repr(e1)}")
 
+    # Fallback SSL 465
+    try:
+        import ssl
+        debug.append("Falling back SSL:465")
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_HOST_REJECT, 465, context=context, timeout=20) as s:
+            s.set_debuglevel(1)
+            s.login(SMTP_USER_REJECT, SMTP_PASS_REJECT)
+            s.sendmail(SMTP_USER_REJECT, [to_email], msg.as_string())
+        return True, "sent via SSL:465"
+    except Exception as e2:
+        debug.append(f"SSL failed: {repr(e2)}")
+        return False, " | ".join(debug)
 
-# =============================
-# Gemini call + validation
-# =============================
+# ───────────────────────────────────────────────────────────────────────────────
+# GEMINI
+# ───────────────────────────────────────────────────────────────────────────────
+
 async def call_gemini(user_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Call Gemini; return parsed JSON dict or None."""
     if not GEMINI_API_KEY:
         return None
 
@@ -271,6 +284,7 @@ async def call_gemini(user_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     )
+
     contents = [
         {"role": "user", "parts": [{"text": PROMPT_SYSTEM}]},
         {"role": "user", "parts": [{"text": json.dumps(user_payload, ensure_ascii=False)}]},
@@ -291,18 +305,17 @@ async def call_gemini(user_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             )
             if not text:
                 return None
+            # try direct JSON
             try:
                 return json.loads(text)
             except json.JSONDecodeError:
-                # Remove possible ```json fences
+                # strip potential code fences
                 text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
                 return json.loads(text)
     except Exception:
         return None
 
-
 def validate_ai_output(ai: Dict[str, Any], form_categoria: str) -> Tuple[bool, str, Dict[str, Any]]:
-    """Validate Gemini output against rules and return (accepted, reason, normalized)."""
     try:
         next_action = (ai.get("next_action") or "").lower().strip()
         router_dec = (ai.get("router_decision") or "").lower().strip()
@@ -310,10 +323,9 @@ def validate_ai_output(ai: Dict[str, Any], form_categoria: str) -> Tuple[bool, s
             return False, "ask_clarify", {}
 
         categoria = ai.get("categoria", "").strip()
-        priorita = ai.get("priorita", "").strip()
-        title = (ai.get("normalized_title") or "").strip()
+        priorita  = ai.get("priorita", "").strip()
+        title     = (ai.get("normalized_title") or "").strip()
 
-        # Category must match exactly what the user selected
         if categoria != form_categoria or categoria not in VALID_CATEGORIES:
             return False, "categoria_mismatch", {}
         if priorita not in VALID_PRIORITIES:
@@ -322,8 +334,9 @@ def validate_ai_output(ai: Dict[str, Any], form_categoria: str) -> Tuple[bool, s
             return False, "title_missing", {}
 
         fields = ai.get("monday_fields", {}) or {}
+
         norm = {
-            "title": title,  # <-- use exactly the Gemini title as item_name
+            "title": title,
             "categoria": categoria,
             "priorita": priorita,
             "fields": {
@@ -334,14 +347,13 @@ def validate_ai_output(ai: Dict[str, Any], form_categoria: str) -> Tuple[bool, s
             },
         }
         return True, "", norm
-
     except Exception:
         return False, "invalid_ai_response", {}
 
+# ───────────────────────────────────────────────────────────────────────────────
+# MONDAY.COM (create item)
+# ───────────────────────────────────────────────────────────────────────────────
 
-# =============================
-# Monday.com
-# =============================
 async def monday_create(item_name: str, column_values: Dict[str, Any]) -> Dict[str, Any]:
     query = """
     mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $columnVals: JSON!) {
@@ -358,7 +370,6 @@ async def monday_create(item_name: str, column_values: Dict[str, Any]) -> Dict[s
         "columnVals": json.dumps(column_values, ensure_ascii=False),
     }
     headers = {"Authorization": MONDAY_API_TOKEN, "Content-Type": "application/json"}
-
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.post("https://api.monday.com/v2", headers=headers, json={"query": query, "variables": variables})
         r.raise_for_status()
@@ -367,102 +378,97 @@ async def monday_create(item_name: str, column_values: Dict[str, Any]) -> Dict[s
             raise HTTPException(status_code=502, detail=data["errors"])
         return data
 
+# ───────────────────────────────────────────────────────────────────────────────
+# FASTAPI
+# ───────────────────────────────────────────────────────────────────────────────
 
-# =============================
-# FastAPI app
-# =============================
 app = FastAPI(title="Aessefin Ticket Router", version="1.4.0")
-
 
 @app.get("/")
 def health():
     return {"status": "ok"}
 
+# Test SMTP in isolation
+@app.post("/test_reject")
+async def test_reject(to: str):
+    ok, dbg = send_reject_email(to)
+    return {"email_sent": ok, "email_debug": dbg}
 
 @app.post("/webhook")
 async def webhook(req: Request, x_forms_secret: Optional[str] = Header(None)):
-    # Authentication shared secret
     if x_forms_secret != FORMS_SHARED_SECRET:
         raise HTTPException(status_code=401, detail="bad secret")
 
     p = await req.json()
-    description = (p.get("description") or "").strip()
-    categoria = (p.get("categoria") or "").strip()
-    priorita = (p.get("priorita") or "").strip()
-    reporter_email = (p.get("email") or "").strip()
+    description    = (p.get("description") or "").strip()
+    categoria      = (p.get("categoria") or "").strip()
+    priorita       = (p.get("priorita")  or "").strip()
+    reporter_email = (p.get("email")     or "").strip()
     link_of_record = (p.get("link_of_record") or "").strip()
-    attachments = p.get("attachments") or []
+    attachments    = p.get("attachments") or []
 
-    # --------------------------
-    # 1) Try Gemini
-    # --------------------------
-    ai_decision = await call_gemini(
-        {
-            "description": description,
-            "categoria": categoria,
-            "priorita": priorita,
-            "email": reporter_email,
-            "link_of_record": link_of_record,
-            "attachments": attachments,
-        }
-    )
+    # ── Try Gemini
+    ai_decision = await call_gemini({
+        "description": description,
+        "categoria": categoria,
+        "priorita": priorita,
+        "email": reporter_email,
+        "link_of_record": link_of_record,
+        "attachments": attachments,
+    })
 
     if ai_decision:
         accepted, reason, norm = validate_ai_output(ai_decision, categoria)
         if accepted:
-            # Use Gemini's title EXACTLY for item_name
-            final_title = norm["title"]
+            # Use Gemini title, then prepend exactly one category tag
+            ai_title    = norm["title"]
+            final_title = build_title_with_category(categoria, ai_title)
 
             fields = norm["fields"]
             col_vals: Dict[str, Any] = {}
-
-            # Description
             if COL_DESCRIPTION:
                 col_vals[COL_DESCRIPTION] = fields.get("Descrizione Dettagliata", "") or description
-
-            # Email column object
             if COL_EMAIL:
                 email_obj = fields.get("Email") or {}
                 col_vals[COL_EMAIL] = {
                     "email": email_obj.get("email", reporter_email),
-                    "text": email_obj.get("text", reporter_email),
+                    "text":  email_obj.get("text",  reporter_email),
                 }
-
-            # Category + Priority from the user (they must match)
             if COL_CATEGORY:
                 col_vals[COL_CATEGORY] = {"label": categoria}
             if COL_PRIORITY:
                 col_vals[COL_PRIORITY] = {"label": priorita}
-
-            # Attachments (only Google Drive/Docs links)
             if COL_ATTACHMENTS:
-                col_vals[COL_ATTACHMENTS] = "\n".join(
-                    filter_drive_links(fields.get("Allegati") or attachments)
-                )
-
-            # Link of the record (long text)
+                col_vals[COL_ATTACHMENTS] = "\n".join(filter_drive_links(fields.get("Allegati") or attachments))
             if COL_LINK_LONGTXT:
                 col_vals[COL_LINK_LONGTXT] = fields.get("Link_of_the_record", link_of_record)
 
             created = await monday_create(final_title, col_vals)
             return {"ok": True, "source": "gemini", "used_title": final_title, "created": created}
 
-        # Rejected by AI → email the user
-        emailed = send_reject_email(reporter_email)
-        return {"ok": False, "reason": f"Rejected by AI: {reason}", "email_sent": emailed}
+        # AI rejected → email the user
+        ok, dbg = send_reject_email(reporter_email)
+        return {
+            "ok": False,
+            "reason": f"Rejected by AI: {reason}",
+            "email_sent": ok,
+            "email_debug": dbg
+        }
 
-    # --------------------------
-    # 2) Fallback if Gemini not available
-    # --------------------------
-    # Simple rule: >= 10 words unless OPERATIONS..., otherwise reject.
+    # ── Fallback rules (no Gemini or error)
     words = len(strip_any_leading_category(description).split())
     is_ops = categoria.upper().startswith("OPERATIONS")
     if words < 10 and not is_ops:
-        emailed = send_reject_email(reporter_email)
-        return {"ok": False, "reason": "Rejected: description too short/vague", "email_sent": emailed}
+        ok, dbg = send_reject_email(reporter_email)
+        return {
+            "ok": False,
+            "reason": "Rejected: description too short/vague",
+            "email_sent": ok,
+            "email_debug": dbg
+        }
 
-    # Fallback title: first sentence only (no category prefix) to avoid "CRM: CRM: ..."
-    final_title = first_sentence(description)
+    core = first_sentence(description)
+    final_title = build_title_with_category(categoria, core)
 
     col_vals: Dict[str, Any] = {}
     if COL_DESCRIPTION:
@@ -480,4 +486,5 @@ async def webhook(req: Request, x_forms_secret: Optional[str] = Header(None)):
 
     created = await monday_create(final_title, col_vals)
     return {"ok": True, "source": "rules", "used_title": final_title, "created": created}
+
 
