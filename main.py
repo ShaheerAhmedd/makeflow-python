@@ -35,30 +35,58 @@ Flow:
 
 This service expects Monday column IDs via environment variables.
 """
+"""
+Aessefin Ticket Router (FastAPI)
+
+- POST /webhook  (JSON body, header: X-Forms-Secret)
+- Validates & routes Google Form submissions to Monday.com
+- Uses Gemini (if GOOGLE_GEMINI_API_KEY set) or OpenAI (if OPENAI_API_KEY set)
+  to decide accept/reject and to suggest a normalized title/summary.
+- Guarantees category prefix appears AT MOST ONCE in the final title.
+
+Env vars needed (Render → Environment):
+  FORMS_SHARED_SECRET
+  MONDAY_API_TOKEN
+  MONDAY_BOARD_ID
+  MONDAY_GROUP_NEW                   (e.g. "topics")
+
+  # Column IDs from the Monday API Playground
+  MONDAY_COLUMN_EMAIL
+  MONDAY_COLUMN_CATEGORY
+  MONDAY_COLUMN_PRIORITY
+  MONDAY_COLUMN_DESCRIPTION
+  MONDAY_COLUMN_ATTACHMENTS
+  MONDAY_COLUMN_LINK_LONGTEXT
+
+  # Optional mail if you ever want to email clarifications
+  EMAIL_TO_DEFAULT
+  SMTP_HOST
+  SMTP_PORT
+  SMTP_USER
+  SMTP_PASS
+
+  # LLM (use one or none)
+  GOOGLE_GEMINI_API_KEY              # preferred
+  OPENAI_API_KEY                     # fallback
+"""
 
 import os
-import json
 import re
-from typing import Optional, Dict, Any, Tuple
+import json
+from typing import Optional, Dict, Any, List
 
 import httpx
 from fastapi import FastAPI, Request, Header, HTTPException
 
-# -----------------------
+# -------------------------
 # Environment
-# -----------------------
+# -------------------------
 FORMS_SHARED_SECRET = os.getenv("FORMS_SHARED_SECRET", "forms-shared-secret-123")
 
-# Gemini
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-
-# Monday
 MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN", "")
-MONDAY_BOARD_ID = os.getenv("MONDAY_BOARD_ID", "")  # integer or string
+MONDAY_BOARD_ID  = os.getenv("MONDAY_BOARD_ID", "")
 MONDAY_GROUP_NEW = os.getenv("MONDAY_GROUP_NEW", "topics")
 
-# Monday column IDs (exact column "id", not title)
 COL_EMAIL        = os.getenv("MONDAY_COLUMN_EMAIL", "")
 COL_CATEGORY     = os.getenv("MONDAY_COLUMN_CATEGORY", "")
 COL_PRIORITY     = os.getenv("MONDAY_COLUMN_PRIORITY", "")
@@ -66,15 +94,91 @@ COL_DESCRIPTION  = os.getenv("MONDAY_COLUMN_DESCRIPTION", "")
 COL_ATTACHMENTS  = os.getenv("MONDAY_COLUMN_ATTACHMENTS", "")
 COL_LINK_LONGTXT = os.getenv("MONDAY_COLUMN_LINK_LONGTEXT", "")
 
-if not (MONDAY_API_TOKEN and MONDAY_BOARD_ID):
-    raise RuntimeError("Set MONDAY_API_TOKEN and MONDAY_BOARD_ID env vars.")
+# LLM (Gemini preferred, OpenAI fallback)
+GEMINI_KEY       = os.getenv("GOOGLE_GEMINI_API_KEY", "")
+GEMINI_MODEL     = os.getenv("GOOGLE_GEMINI_MODEL", "gemini-1.5-flash")
+OPENAI_KEY       = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("Set GEMINI_API_KEY to enable Gemini routing.")
+# -------------------------
+# FastAPI
+# -------------------------
+app = FastAPI(title="Aessefin Ticket Router", version="2.0")
 
-# -----------------------
-# Prompt (your exact text)
-# -----------------------
+
+# -------------------------
+# Helpers (validation)
+# -------------------------
+CATEGORIES_ALLOWED = {
+    "CRM",
+    "AMMINISTRAZIONE",
+    "CONSOLE",
+    "OPERATIONS (Cambi asseganzione, etc.)",
+}
+
+def valid_category(cat: str) -> bool:
+    return cat in CATEGORIES_ALLOWED
+
+def word_count(text: str) -> int:
+    return len([w for w in (text or "").strip().split() if w])
+
+def is_vague(text: str) -> bool:
+    """Very simple vagueness detection."""
+    t = (text or "").lower().strip()
+    vague = [
+        r"\bi have (an )?issue\b",
+        r"\bsomething (is )?not working\b",
+        r"\bplease fix\b",
+        r"^help\b",
+        r"\bhelp\b$",
+    ]
+    return any(re.search(p, t) for p in vague)
+
+def is_drive_url(u: str) -> bool:
+    u = (u or "").strip().lower()
+    return u.startswith("https://drive.google.com/") or u.startswith("http://drive.google.com/")
+
+def filter_drive_urls(urls: List[str]) -> List[str]:
+    if not urls:
+        return []
+    return [u for u in urls if is_drive_url(u)]
+
+# -------------------------
+# Helpers (title handling)
+# -------------------------
+def strip_cat_prefix(text: str, categoria: str) -> str:
+    """Remove a leading '<categoria>:' if already present (case-insensitive)."""
+    if not text or not categoria:
+        return (text or "").strip()
+    pat = r'^\s*' + re.escape(categoria) + r'\s*:\s*'
+    return re.sub(pat, '', text, flags=re.IGNORECASE).strip()
+
+def ensure_single_cat_prefix(title: str, categoria: str) -> str:
+    """
+    Ensure the title has the category prefix at most once.
+    """
+    core = strip_cat_prefix(title, categoria)
+    return f"{categoria}: {core}" if categoria and core else (title or categoria)
+
+def clip30(s: str) -> str:
+    s = (s or "").strip()
+    return (s[:27] + "…") if len(s) > 30 else s
+
+def normalize_title(desc: str, categoria: str) -> str:
+    # Remove any existing category prefix
+    base = strip_cat_prefix(desc or "", categoria)
+    # Take the first sentence / few words for compactness
+    first = re.split(r"[.!?\n]", base.strip())[0] or base.strip()
+    words = first.split()
+    first = " ".join(words[:6]) if len(words) > 6 else first
+    if first:
+        first = first[:1].upper() + first[1:]
+    return clip30(first or "Ticket")
+
+
+# -------------------------
+# LLM prompt
+# -------------------------
 PROMPT_SYSTEM = (
     'You are "Ticket Verificator Bot". You evaluate Google Form responses to decide if they can '
     'become tickets in Monday.com.\n\n'
@@ -119,104 +223,84 @@ PROMPT_SYSTEM = (
     "}\n"
 )
 
-# -----------------------
-# FastAPI
-# -----------------------
-app = FastAPI(title="Aessefin Ticket Router")
-
-# -----------------------
-# Helpers
-# -----------------------
-def is_vague_rule(text: str, categoria: str) -> bool:
-    """Conservative fallback gate if Gemini fails."""
-    t = (text or "").strip().lower()
-    words = len(t.split())
-    if categoria.upper().startswith("OPERATIONS"):
-        return False  # exception for operations (still meaningful)
-    if words < 10:
-        return True
-    vague = [
-        r"\bi have (an )?issue\b",
-        r"\bsomething (is )?not working\b",
-        r"\bplease fix\b",
-        r"^help\b",
-        r"\bhelp\b$",
-    ]
-    return any(re.search(p, t) for p in vague)
-
-def dedupe_category_prefix(title: str, categoria: str) -> str:
-    t = title.strip()
-    if not categoria:
-        return t
-    c = categoria.strip()
-    pattern = re.compile(rf"^{re.escape(c)}:\s*", re.IGNORECASE)
-    t = pattern.sub("", t)
-    base = f"{c}: {t}" if t else c
-    return (base[:27] + "…") if len(base) > 30 else base
-
-def only_drive_links(urls: list) -> list:
-    out = []
-    for u in urls or []:
-        if isinstance(u, str) and ("drive.google.com" in u or "docs.google.com" in u):
-            out.append(u)
-    return out
-
-def norm_priority(label: str) -> str:
-    if not label: return ""
-    m = label.strip().upper()
-    mapping = {"URGENTE": "URGENTE", "MEDIA": "MEDIA", "ALTA": "ALTA", "BASSA": "BASSA",
-               "URGENT": "URGENTE", "MEDIUM": "MEDIA", "HIGH": "ALTA", "LOW": "BASSA"}
-    return mapping.get(m, m)
-
-# -----------------------
-# Gemini call
-# -----------------------
-async def gemini_route(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Calls Gemini with the strict system prompt and returns a parsed JSON dict:
-    {
-      next_action, router_decision, normalized_title, categoria, priorita, monday_fields:{...}
+def build_user_payload(description: str, categoria: str, priorita: str,
+                       reporter_email: str, link_of_record: str, attachments: list) -> str:
+    inp = {
+        "description": description,
+        "categoria": categoria,
+        "priorita": priorita,
+        "email": reporter_email,
+        "link_of_record": link_of_record,
+        "attachments": attachments or []
     }
-    """
-    body = {
+    return json.dumps(inp, ensure_ascii=False)
+
+
+# -------------------------
+# LLM calls
+# -------------------------
+async def llm_analyze_with_gemini(user_json: str) -> Optional[dict]:
+    if not GEMINI_KEY:
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+    payload = {
         "contents": [
-            {
-                "parts": [
-                    {"text": PROMPT_SYSTEM},
-                    {"text": "Input JSON to evaluate:\n" + json.dumps(payload, ensure_ascii=False)}
-                ]
-            }
+            {"role": "user", "parts": [{"text": PROMPT_SYSTEM}]},
+            {"role": "user", "parts": [{"text": user_json}]},
         ],
-        # Ask for JSON output explicitly
-        "generationConfig": {
-            "responseMimeType": "application/json"
-        }
+        "generationConfig": {"temperature": 0.2}
     }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    async with httpx.AsyncClient(timeout=45) as client:
-        r = await client.post(url, json=body)
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(url, json=payload)
         r.raise_for_status()
         data = r.json()
         try:
             text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Gemini malformed response: {e}")
+            return json.loads(text)
+        except Exception:
+            return None
 
-    try:
-        parsed = json.loads(text)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Gemini did not return JSON: {e}")
+async def llm_analyze_with_openai(user_json: str) -> Optional[dict]:
+    if not OPENAI_KEY:
+        return None
+    headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": PROMPT_SYSTEM},
+            {"role": "user", "content": user_json},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+    }
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        try:
+            text = data["choices"][0]["message"]["content"]
+            return json.loads(text)
+        except Exception:
+            return None
 
-    # Minimal shape check
-    for k in ["next_action", "router_decision", "normalized_title", "monday_fields"]:
-        if k not in parsed:
-            raise HTTPException(status_code=502, detail=f"Gemini missing key: {k}")
-    return parsed
+async def llm_decide(description: str, categoria: str, priorita: str,
+                     reporter_email: str, link_of_record: str, attachments: list) -> Optional[dict]:
+    user_json = build_user_payload(description, categoria, priorita, reporter_email, link_of_record, attachments)
+    # Gemini first
+    out = await llm_analyze_with_gemini(user_json)
+    if out:
+        return out
+    # Fallback OpenAI
+    out = await llm_analyze_with_openai(user_json)
+    return out
 
-# -----------------------
-# Monday creation
-# -----------------------
+
+# -------------------------
+# Monday.com call
+# -------------------------
 async def monday_create(item_name: str, column_values: Dict[str, Any]) -> Dict[str, Any]:
+    if not MONDAY_API_TOKEN or not MONDAY_BOARD_ID:
+        raise HTTPException(status_code=500, detail="Monday API not configured.")
     query = """
     mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $columnVals: JSON!) {
       create_item(board_id: $boardId, group_id: $groupId, item_name: $itemName, column_values: $columnVals) {
@@ -229,7 +313,7 @@ async def monday_create(item_name: str, column_values: Dict[str, Any]) -> Dict[s
         "boardId": MONDAY_BOARD_ID,
         "groupId": MONDAY_GROUP_NEW,
         "itemName": item_name,
-        "columnVals": json.dumps(column_values)
+        "columnVals": json.dumps(column_values, ensure_ascii=False),
     }
     headers = {"Authorization": MONDAY_API_TOKEN, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30) as c:
@@ -240,79 +324,104 @@ async def monday_create(item_name: str, column_values: Dict[str, Any]) -> Dict[s
             raise HTTPException(status_code=502, detail=data["errors"])
         return data
 
-# -----------------------
-# Routes
-# -----------------------
-@app.get("/")
-def health():
-    return {"status": "ok"}
 
+# -------------------------
+# Webhook
+# -------------------------
 @app.post("/webhook")
 async def webhook(req: Request, x_forms_secret: Optional[str] = Header(None)):
-    # 1) Secret check
     if x_forms_secret != FORMS_SHARED_SECRET:
         raise HTTPException(status_code=401, detail="bad secret")
 
-    # 2) Read input
     p = await req.json()
+
     description    = (p.get("description") or "").strip()
     categoria      = (p.get("categoria") or "").strip()
     priorita       = (p.get("priorita")  or "").strip()
     reporter_email = (p.get("email")     or "").strip()
     link_of_record = (p.get("link_of_record") or "").strip()
-    attachments    = p.get("attachments") or []
+    attachments_in = p.get("attachments") or []
+    attachments    = filter_drive_urls(attachments_in)
 
-    # 3) Ask Gemini
-    try:
-        g = await gemini_route(p)
-    except HTTPException:
-        # If Gemini fails hard, use conservative fallback
-        if is_vague_rule(description, categoria):
-            return {"ok": False, "routed_to": "ask_clarify", "reason": "fallback_vague"}
-        # else create with a simple title
-        title = description.split("\n")[0][:30] or "Ticket"
-        title = dedupe_category_prefix(title, categoria)
+    # Validate category
+    if not valid_category(categoria):
+        raise HTTPException(status_code=400, detail="Rejected: invalid category")
+
+    # LLM FIRST if available
+    llm = await llm_decide(description, categoria, priorita, reporter_email, link_of_record, attachments)
+
+    if llm:
+        next_action = (llm.get("next_action") or "").lower()
+        router_dec  = (llm.get("router_decision") or "").lower()
+        norm_title  = (llm.get("normalized_title") or "").strip()
+
+        if next_action == "ask_clarify" or router_dec == "ask_clarify":
+            raise HTTPException(status_code=400, detail="Rejected by LLM: ask_clarify")
+
+        # Build item title with AT MOST ONE category prefix
+        title_raw = norm_title if norm_title else normalize_title(description, categoria)
+        item_name = clip30(ensure_single_cat_prefix(title_raw, categoria))
+
+        # Map to columns (use llm['monday_fields'] if present; otherwise fallback)
+        fields = llm.get("monday_fields") or {}
+        # Ensure we still fill our known columns
         col_vals: Dict[str, Any] = {}
-        if COL_DESCRIPTION:  col_vals[COL_DESCRIPTION] = description
-        if COL_EMAIL:        col_vals[COL_EMAIL]       = {"email": reporter_email, "text": reporter_email}
-        if COL_CATEGORY and categoria: col_vals[COL_CATEGORY] = {"label": categoria}
-        if COL_PRIORITY and priorita:  col_vals[COL_PRIORITY]  = {"label": priorita}
-        if COL_ATTACHMENTS:  col_vals[COL_ATTACHMENTS] = "\n".join(only_drive_links(attachments))
-        if COL_LINK_LONGTXT and link_of_record: col_vals[COL_LINK_LONGTXT] = link_of_record
-        created = await monday_create(item_name=title, column_values=col_vals)
-        return {"ok": True, "routed_to": "create_fallback", "created": created}
+        if COL_DESCRIPTION:
+            col_vals[COL_DESCRIPTION] = fields.get("Descrizione Dettagliata") or description
 
-    # 4) Obey Gemini router
-    action = str(g.get("next_action", "")).lower()
-    if action != "create":
-        # ask_clarify: do not create the item
-        return {"ok": False, "routed_to": "ask_clarify", "ai": g}
+        if COL_EMAIL:
+            email_obj = fields.get("Email") or ({"email": reporter_email, "text": reporter_email} if reporter_email else {"email": "", "text": ""})
+            col_vals[COL_EMAIL] = email_obj
 
-    # 5) Build title from Gemini (and dedupe category)
-    ai_title = (g.get("normalized_title") or "").strip()
-    title = ai_title or (description.split("\n")[0][:30] or "Ticket")
-    title = dedupe_category_prefix(title, categoria)
+        if COL_CATEGORY and categoria:
+            col_vals[COL_CATEGORY] = {"label": categoria}
 
-    # 6) Column values – prefer Gemini’s monday_fields, but enforce board schema
-    mf = g.get("monday_fields", {}) or {}
+        if COL_PRIORITY and priorita:
+            col_vals[COL_PRIORITY] = {"label": priorita}
 
-    # Category & Priority normalization
-    categoria_label = mf.get("Categoria") or categoria
-    priorita_label  = norm_priority(mf.get("Priorità") or priorita)
+        if COL_ATTACHMENTS and attachments:
+            col_vals[COL_ATTACHMENTS] = "\n".join(attachments)
 
-    email_obj = mf.get("Email") or {"email": reporter_email, "text": reporter_email}
-    drive_links = only_drive_links(mf.get("Allegati") if isinstance(mf.get("Allegati"), list) else attachments)
+        if COL_LINK_LONGTXT and link_of_record:
+            col_vals[COL_LINK_LONGTXT] = link_of_record
 
-    descr = mf.get("Descrizione Dettagliata") or description
-    link  = mf.get("Link_of_the_record") or link_of_record
+        created = await monday_create(item_name=item_name, column_values=col_vals)
+        return {"ok": True, "source": "llm", "created": created, "item_name": item_name}
+
+    # ---- No LLM available: rule-based fallback ----
+    is_ops = categoria.upper().startswith("OPERATIONS")
+    if word_count(description) < 10 and not is_ops:
+        raise HTTPException(status_code=400, detail="Rejected: description too short")
+    if is_vague(description) and not is_ops:
+        raise HTTPException(status_code=400, detail="Rejected: description too vague")
+
+    title_raw = normalize_title(description, categoria)
+    item_name = clip30(ensure_single_cat_prefix(title_raw, categoria))
 
     col_vals: Dict[str, Any] = {}
-    if COL_DESCRIPTION:  col_vals[COL_DESCRIPTION] = descr
-    if COL_EMAIL:        col_vals[COL_EMAIL]       = {"email": email_obj.get("email",""), "text": email_obj.get("text","")}
-    if COL_CATEGORY and categoria_label: col_vals[COL_CATEGORY] = {"label": categoria_label}
-    if COL_PRIORITY and priorita_label:  col_vals[COL_PRIORITY]  = {"label": priorita_label}
-    if COL_ATTACHMENTS and drive_links:  col_vals[COL_ATTACHMENTS] = "\n".join(drive_links)
-    if COL_LINK_LONGTXT and link:        col_vals[COL_LINK_LONGTXT] = link
+    if COL_DESCRIPTION:
+        col_vals[COL_DESCRIPTION] = description
 
-    created = await monday_create(item_name=title, column_values=col_vals)
-    return {"ok": True, "routed_to": "create", "created": created, "ai": g}
+    if COL_EMAIL:
+        col_vals[COL_EMAIL] = {"email": reporter_email, "text": reporter_email} if reporter_email else {"email": "", "text": ""}
+
+    if COL_CATEGORY and categoria:
+        col_vals[COL_CATEGORY] = {"label": categoria}
+
+    if COL_PRIORITY and priorita:
+        col_vals[COL_PRIORITY] = {"label": priorita}
+
+    if COL_ATTACHMENTS and attachments:
+        col_vals[COL_ATTACHMENTS] = "\n".join(attachments)
+
+    if COL_LINK_LONGTXT and link_of_record:
+        col_vals[COL_LINK_LONGTXT] = link_of_record
+
+    created = await monday_create(item_name=item_name, column_values=col_vals)
+    return {"ok": True, "source": "rules", "created": created, "item_name": item_name}
+
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
+
