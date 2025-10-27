@@ -70,16 +70,18 @@ Env vars needed (Render → Environment):
   OPENAI_API_KEY                     # fallback
 """
 
-import os, json, re
-from typing import Optional, Dict, Any, List, Tuple
-
+import os, re, json
+from typing import Optional, Dict, Any, List
 import httpx
 from fastapi import FastAPI, Request, Header, HTTPException
 
 # -----------------------------
-# Environment
+# Env / Config
 # -----------------------------
 FORMS_SHARED_SECRET = os.getenv("FORMS_SHARED_SECRET", "forms-shared-secret-123")
+
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN", "")
 MONDAY_BOARD_ID  = os.getenv("MONDAY_BOARD_ID", "")
@@ -92,21 +94,17 @@ COL_DESCRIPTION  = os.getenv("MONDAY_COLUMN_DESCRIPTION", "")
 COL_ATTACHMENTS  = os.getenv("MONDAY_COLUMN_ATTACHMENTS", "")
 COL_LINK_LONGTXT = os.getenv("MONDAY_COLUMN_LINK_LONGTEXT", "")
 
-# Gemini (optional but recommended)
-GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-
 if not MONDAY_API_TOKEN or not MONDAY_BOARD_ID:
-    raise RuntimeError("Set MONDAY_API_TOKEN and MONDAY_BOARD_ID.")
+    raise RuntimeError("Set MONDAY_API_TOKEN and MONDAY_BOARD_ID")
 
-# -----------------------------
-# Constants / Prompt
-# -----------------------------
 VALID_CATEGORIES = {
     "CRM", "AMMINISTRAZIONE", "CONSOLE", "OPERATIONS (Cambi asseganzione, etc.)"
 }
 VALID_PRIORITIES = {"URGENTE", "MEDIA", "ALTA", "BASSA"}
 
+# -----------------------------
+# Prompt (your Make.com rubric)
+# -----------------------------
 PROMPT_SYSTEM = (
     'You are "Ticket Verificator Bot". You evaluate Google Form responses to decide if they can '
     'become tickets in Monday.com.\n\n'
@@ -152,45 +150,117 @@ PROMPT_SYSTEM = (
 )
 
 # -----------------------------
-# App
+# Helpers (title, filters, etc.)
 # -----------------------------
-app = FastAPI(title="Aessefin Ticket Router (Gemini)")
+def strip_any_leading_category(text: str) -> str:
+    if not text:
+        return text
+    cats = [
+        r"CRM",
+        r"AMMINISTRAZIONE",
+        r"CONSOLE",
+        r"OPERATIONS \(Cambi asseganzione, etc\.\)",
+    ]
+    pattern = rf"^\s*(?:{'|'.join(cats)})\s*[:\-–—]?\s*"
+    return re.sub(pattern, "", text.strip(), flags=re.IGNORECASE).strip()
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def strip_leading_category(desc: str) -> str:
-    """Remove a leading known category like 'CRM:' from description to avoid doubling in titles."""
-    if not desc:
-        return desc
-    lead = desc.strip()
-    for cat in VALID_CATEGORIES:
-        prefix = f"{cat}:"
-        if lead.upper().startswith(prefix):
-            return lead[len(prefix):].lstrip()
-    return lead
+def build_title_with_category(category: str, candidate: str, max_len: int = 30) -> str:
+    core = strip_any_leading_category(candidate) or "Ticket"
+    clean = f"{category}: {core}"
+    return clean if len(clean) <= max_len else clean[:max_len - 1] + "…"
 
-def make_prefixed_title(category: str, core_title: str, max_len: int = 30) -> str:
-    """
-    Ensure the category appears once as 'CAT: Title'. If 'core_title' already starts with
-    category + ':', don’t duplicate it.
-    """
-    core = core_title.strip()
-    if core.upper().startswith(f"{category}:"):
-        title = core  # already prefixed
-    else:
-        title = f"{category}: {core}"
-
-    if len(title) > max_len:
-        return title[: max_len - 1] + "…"
-    return title
-
-def is_drive_url(url: str) -> bool:
-    return "drive.google.com" in (url or "")
+def first_sentence(text: str) -> str:
+    if not text:
+        return "Ticket"
+    clean = strip_any_leading_category(text)
+    sent = re.split(r"[.!?\n]", clean, maxsplit=1)[0].strip()
+    return sent or "Ticket"
 
 def filter_drive_links(urls: List[str]) -> List[str]:
-    return [u for u in urls if is_drive_url(u)]
+    out = []
+    for u in urls or []:
+        if isinstance(u, str) and ("drive.google.com" in u or "docs.google.com" in u):
+            out.append(u)
+    return out
 
+# -----------------------------
+# Gemini
+# -----------------------------
+async def call_gemini(user_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not GEMINI_API_KEY:
+        return None
+    # Google Generative Language API (v1beta)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    contents = [
+        {"role": "user", "parts": [{"text": PROMPT_SYSTEM}]},
+        {"role": "user", "parts": [{"text": json.dumps(user_payload, ensure_ascii=False)}]},
+    ]
+    body = {"contents": contents, "generationConfig": {"temperature": 0.2}}
+    try:
+        async with httpx.AsyncClient(timeout=25) as c:
+            r = await c.post(url, json=body)
+            r.raise_for_status()
+            data = r.json()
+            text = (
+                data.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+                .strip()
+            )
+            if not text:
+                return None
+            # Try to parse strict JSON
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                # strip code fences if present
+                text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+                return json.loads(text)
+    except Exception:
+        return None
+
+def validate_ai_output(ai: Dict[str, Any], form_categoria: str) -> (bool, str, Dict[str, Any]):
+    try:
+        next_action = (ai.get("next_action") or "").lower().strip()
+        router_dec = (ai.get("router_decision") or "").lower().strip()
+        if next_action != "create" or router_dec != "create":
+            return False, "ask_clarify", {}
+
+        categoria = ai.get("categoria", "").strip()
+        priorita  = ai.get("priorita", "").strip()
+        title     = (ai.get("normalized_title") or "").strip()
+
+        # Hard constraints: must echo the form category & be valid
+        if categoria != form_categoria or categoria not in VALID_CATEGORIES:
+            return False, "categoria_mismatch", {}
+
+        if priorita not in VALID_PRIORITIES:
+            return False, "priorita_invalid", {}
+
+        fields = ai.get("monday_fields", {}) or {}
+        # Minimal presence
+        if not title:
+            return False, "title_missing", {}
+
+        norm = {
+            "title": title,
+            "categoria": categoria,
+            "priorita": priorita,
+            "fields": {
+                "Descrizione Dettagliata": fields.get("Descrizione Dettagliata", ""),
+                "Allegati": fields.get("Allegati", []) or [],
+                "Link_of_the_record": fields.get("Link_of_the_record", ""),
+                "Email": fields.get("Email", {"email": "", "text": ""}),
+            },
+        }
+        return True, "", norm
+    except Exception:
+        return False, "invalid_ai_response", {}
+
+# -----------------------------
+# Monday.com
+# -----------------------------
 async def monday_create(item_name: str, column_values: Dict[str, Any]) -> Dict[str, Any]:
     query = """
     mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $columnVals: JSON!) {
@@ -204,7 +274,7 @@ async def monday_create(item_name: str, column_values: Dict[str, Any]) -> Dict[s
         "boardId": MONDAY_BOARD_ID,
         "groupId": MONDAY_GROUP_NEW,
         "itemName": item_name,
-        "columnVals": json.dumps(column_values),
+        "columnVals": json.dumps(column_values, ensure_ascii=False),
     }
     headers = {"Authorization": MONDAY_API_TOKEN, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30) as c:
@@ -216,98 +286,10 @@ async def monday_create(item_name: str, column_values: Dict[str, Any]) -> Dict[s
         return data
 
 # -----------------------------
-# LLM (Gemini)
+# FastAPI
 # -----------------------------
-async def call_gemini(form_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Call Gemini with the Ticket Verificator prompt. Return parsed JSON dict or None on failure.
-    """
-    if not GEMINI_API_KEY:
-        return None
+app = FastAPI(title="Aessefin Ticket Router", version="1.2.0")
 
-    # Clean & prep payload for the model
-    payload_to_model = {
-        "description": strip_leading_category(form_payload.get("description", "")),
-        "categoria": form_payload.get("categoria", ""),
-        "priorita": form_payload.get("priorita", ""),
-        "email": form_payload.get("email", ""),
-        "link_of_record": form_payload.get("link_of_record", ""),
-        "attachments": form_payload.get("attachments", []),
-    }
-
-    gen_input = (
-        PROMPT_SYSTEM
-        + "\n\nINPUT:\n"
-        + json.dumps(payload_to_model, ensure_ascii=False)
-    )
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    body = {
-        "contents": [
-            {"parts": [{"text": gen_input}]}
-        ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "response_mime_type": "application/json"
-        }
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(url, json=body)
-            resp.raise_for_status()
-            data = resp.json()
-            # Gemini returns text in candidates[0].content.parts[].text
-            candidates = data.get("candidates") or []
-            if not candidates:
-                return None
-            txt = ""
-            for part in candidates[0].get("content", {}).get("parts", []):
-                if "text" in part:
-                    txt += part["text"]
-            txt = txt.strip()
-            # try to parse JSON
-            return json.loads(txt)
-    except Exception:
-        return None
-
-def validate_ai_output(ai: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
-    """
-    Validate the AI JSON. Return (accepted, reason, normalized_dict).
-    """
-    if not isinstance(ai, dict):
-        return False, "AI output not dict", {}
-
-    na = ai.get("next_action", "")
-    rd = ai.get("router_decision", "")
-
-    accepted = (na == "create" and rd == "create")
-    normalized_title = (ai.get("normalized_title") or "").strip()
-    categoria = (ai.get("categoria") or "").strip()
-    priorita = (ai.get("priorita") or "").strip()
-
-    if categoria not in VALID_CATEGORIES:
-        return False, "Invalid categoria from AI", {}
-
-    if priorita not in VALID_PRIORITIES:
-        return False, "Invalid priorita from AI", {}
-
-    monday_fields = ai.get("monday_fields") or {}
-    # required keys check
-    mf_required = ["Item", "Categoria", "Priorità", "Descrizione Dettagliata", "Allegati", "Link_of_the_record", "Email"]
-    if not all(k in monday_fields for k in mf_required):
-        return False, "AI monday_fields missing keys", {}
-
-    return accepted, "", {
-        "title": normalized_title,
-        "categoria": categoria,
-        "priorita": priorita,
-        "fields": monday_fields
-    }
-
-# -----------------------------
-# Routes
-# -----------------------------
 @app.get("/")
 def health():
     return {"status": "ok"}
@@ -318,91 +300,82 @@ async def webhook(req: Request, x_forms_secret: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail="bad secret")
 
     p = await req.json()
+    # Google Form fields (from your form)
     description    = (p.get("description") or "").strip()
-    categoria      = (p.get("categoria") or "").strip()
-    priorita       = (p.get("priorita")  or "").strip()
+    categoria      = (p.get("categoria") or "").strip()     # always provided by the form
+    priorita       = (p.get("priorita")  or "").strip()     # always provided by the form
     reporter_email = (p.get("email")     or "").strip()
     link_of_record = (p.get("link_of_record") or "").strip()
     attachments    = p.get("attachments") or []
 
-    # 1) Try Gemini to decide + format
-    ai_decision = await call_gemini(p)
+    # ---------- Try Gemini ----------
+    ai_decision = await call_gemini({
+        "description": description,
+        "categoria": categoria,
+        "priorita": priorita,
+        "email": reporter_email,
+        "link_of_record": link_of_record,
+        "attachments": attachments,
+    })
 
     if ai_decision:
-        accepted, reason, norm = validate_ai_output(ai_decision)
+        accepted, reason, norm = validate_ai_output(ai_decision, categoria)
         if accepted:
-            # Use AI title and fields
-            ai_title   = norm["title"] or "Ticket"
-            ai_cat     = norm["categoria"]
-            ai_prio    = norm["priorita"]
-            fields     = norm["fields"]
+            ai_title = norm["title"]
+            final_title = build_title_with_category(categoria, ai_title)
 
-            # Ensure category prefix exactly once in title
-            clean_title = make_prefixed_title(ai_cat, ai_title)
-
-            # Map AI fields to Monday columns
+            fields = norm["fields"]
             col_vals: Dict[str, Any] = {}
             if COL_DESCRIPTION:
-                col_vals[COL_DESCRIPTION] = fields.get("Descrizione Dettagliata", "")
+                col_vals[COL_DESCRIPTION] = fields.get("Descrizione Dettagliata", "") or description
 
             if COL_EMAIL:
                 email_obj = fields.get("Email") or {}
                 col_vals[COL_EMAIL] = {
-                    "email": email_obj.get("email", ""),
-                    "text":  email_obj.get("text",  "")
+                    "email": email_obj.get("email", reporter_email),
+                    "text":  email_obj.get("text",  reporter_email),
                 }
 
             if COL_CATEGORY:
-                col_vals[COL_CATEGORY] = {"label": ai_cat}
+                col_vals[COL_CATEGORY] = {"label": categoria}
 
             if COL_PRIORITY:
-                col_vals[COL_PRIORITY] = {"label": ai_prio}
+                col_vals[COL_PRIORITY] = {"label": priorita}
 
             if COL_ATTACHMENTS:
-                col_vals[COL_ATTACHMENTS] = "\n".join(filter_drive_links(fields.get("Allegati") or []))
+                col_vals[COL_ATTACHMENTS] = "\n".join(filter_drive_links(fields.get("Allegati") or attachments))
 
             if COL_LINK_LONGTXT:
-                col_vals[COL_LINK_LONGTXT] = fields.get("Link_of_the_record", "")
+                col_vals[COL_LINK_LONGTXT] = fields.get("Link_of_the_record", link_of_record)
 
-            created = await monday_create(clean_title, col_vals)
-            return {"ok": True, "source": "gemini", "created": created}
+            created = await monday_create(final_title, col_vals)
+            return {"ok": True, "source": "gemini", "used_title": final_title, "created": created}
 
-        else:
-            # AI says ask clarify or invalid => reject
-            raise HTTPException(status_code=400, detail=f"Rejected by AI: {reason or 'ask_clarify'}")
+        # AI rejected
+        raise HTTPException(status_code=400, detail=f"Rejected by AI: {reason}")
 
-    # 2) Fallback (no Gemini / failed): very light rules (minimum gate) + short title
-    #    - Accept if >= 10 words or category starts with OPERATIONS
-    words = len(strip_leading_category(description).split())
+    # ---------- Fallback (no Gemini / error) ----------
+    words = len(strip_any_leading_category(description).split())
     is_ops = categoria.upper().startswith("OPERATIONS")
     if words < 10 and not is_ops:
         raise HTTPException(status_code=400, detail="Rejected: description too short/vague")
 
-    # naive core title: first sentence trimmed
-    core = re.split(r"[.!?\n]", strip_leading_category(description))[0].strip() or "Ticket"
-    core = " ".join(core.split())  # normalize spaces
-
-    # ensure single category prefix
-    final_title = make_prefixed_title(categoria, core)
+    core = first_sentence(description)
+    final_title = build_title_with_category(categoria, core)
 
     col_vals: Dict[str, Any] = {}
     if COL_DESCRIPTION:
         col_vals[COL_DESCRIPTION] = description
-
     if COL_EMAIL:
-        col_vals[COL_EMAIL] = {"email": reporter_email, "text": reporter_email} if reporter_email else {"email": "", "text": ""}
-
-    if COL_CATEGORY and categoria:
+        col_vals[COL_EMAIL] = {"email": reporter_email, "text": reporter_email}
+    if COL_CATEGORY:
         col_vals[COL_CATEGORY] = {"label": categoria}
-
-    if COL_PRIORITY and priorita:
+    if COL_PRIORITY:
         col_vals[COL_PRIORITY] = {"label": priorita}
-
     if COL_ATTACHMENTS and attachments:
         col_vals[COL_ATTACHMENTS] = "\n".join(filter_drive_links(attachments))
-
     if COL_LINK_LONGTXT and link_of_record:
         col_vals[COL_LINK_LONGTXT] = link_of_record
 
     created = await monday_create(final_title, col_vals)
-    return {"ok": True, "source": "rules", "created": created}
+    return {"ok": True, "source": "rules", "used_title": final_title, "created": created}
