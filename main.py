@@ -20,228 +20,105 @@ curl -X POST http://127.0.0.1:8000/webhook \
   -d '{"sender":"alice@example.com","subject":"Need access","message":"Please create a task to add me to the workspace"}'
 """
 
-import os
-import json
-import smtplib
+import os, json
+from typing import Any, Dict, List, Optional
+
 import httpx
-from email.mime.text import MIMEText
-from typing import Optional, Literal
+from fastapi import FastAPI, Request, Header, HTTPException
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings
+# --------- ENV / CONFIG ----------
+MONDAY_API_TOKEN      = os.getenv("MONDAY_API_TOKEN", "")
+MONDAY_BOARD_ID       = os.getenv("MONDAY_BOARD_ID", "")
+MONDAY_GROUP_NEW      = os.getenv("MONDAY_GROUP_NEW", "topics")
 
-# -----------------------------
-# Config
-# -----------------------------
-class Settings(BaseSettings):
-    # Email (Gmail via SMTP with App Password)
-    SMTP_HOST: str = "smtp.gmail.com"
-    SMTP_PORT: int = 587
-    SMTP_USER: str = ""            # your Gmail address
-    SMTP_PASS: str = ""            # app password (NOT your login password)
-    EMAIL_TO_DEFAULT: str = ""     # fallback recipient for clarify path
+# Column IDs on your board
+COL_EMAIL             = os.getenv("MONDAY_COLUMN_EMAIL", "email_mkw8932y")
+COL_CATEGORY          = os.getenv("MONDAY_COLUMN_CATEGORY", "color_mkwx44c")
+COL_PRIORITY          = os.getenv("MONDAY_COLUMN_PRIORITY", "color_mkwten2j")
+COL_DESCRIPTION       = os.getenv("MONDAY_COLUMN_DESCRIPTION", "text_mkw4jrjy")
 
-    # Monday.com
-    MONDAY_API_TOKEN: str = ""
-    MONDAY_BOARD_ID: Optional[int] = None
-    MONDAY_GROUP_ID: Optional[str] = None  # e.g., "topics"
+FORMS_SHARED_SECRET   = os.getenv("FORMS_SHARED_SECRET", "forms-shared-secret-123")
 
-    # Optional OpenAI for AI-assisted processing
-    OPENAI_API_KEY: Optional[str] = None
-    OPENAI_MODEL: str = "gpt-4o-mini"
+if not MONDAY_API_TOKEN or not MONDAY_BOARD_ID:
+    raise RuntimeError("Set MONDAY_API_TOKEN and MONDAY_BOARD_ID in environment.")
 
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
-
-settings = Settings()
-
-# -----------------------------
-# Data models
-# -----------------------------
-class Incoming(BaseModel):
-    sender: Optional[str] = None
-    subject: Optional[str] = None
-    message: str = Field(..., description="Free text from the webhook")
-    metadata: Optional[dict] = None
-
-class AIResult(BaseModel):
-    intent: Literal["clarify", "create"]
-    summary: str
-    priority: Literal["low", "medium", "high"] = "medium"
-    reason: Optional[str] = None
-
-# -----------------------------
-# Classifier (rule-based + optional LLM)
-# -----------------------------
-KEYWORDS_CREATE = [
-    "create", "open ticket", "raise ticket", "new item",
-    "add task", "setup", "provision", "access", "request",
-]
-
-KEYWORDS_CLARIFY = [
-    "clarify", "question", "unsure", "help", "details", "explain",
-]
-
-def classify_rule_based(text: str) -> AIResult:
-    t = text.lower()
-    if any(k in t for k in KEYWORDS_CREATE):
-        return AIResult(
-            intent="create",
-            summary=text.strip()[:160],
-            priority="medium",
-            reason="Matched create keywords"
-        )
-    if "urgent" in t or "asap" in t:
-        return AIResult(
-            intent="create",
-            summary=text.strip()[:160],
-            priority="high",
-            reason="Urgency markers detected"
-        )
-    if any(k in t for k in KEYWORDS_CLARIFY):
-        return AIResult(
-            intent="clarify",
-            summary=text.strip()[:160],
-            priority="low",
-            reason="Matched clarify keywords"
-        )
-    # default: ask for clarification
-    return AIResult(
-        intent="clarify",
-        summary=text.strip()[:160],
-        priority="low",
-        reason="No strong pattern; defaulting to clarify"
-    )
-
-async def classify_with_llm(text: str) -> Optional[AIResult]:
-    """Optional: use OpenAI if OPENAI_API_KEY is present. Returns None if not configured."""
-    if not settings.OPENAI_API_KEY:
-        return None
-    # Minimal, dependency-free OpenAI call via httpx
-    system = (
-        "You are a routing assistant. "
-        "Read the user's message and decide whether we should 'create' an item in monday.com "
-        "or 'clarify' via email first. Return strict JSON with keys: intent, summary, priority, reason. "
-        "intent must be 'create' or 'clarify'. priority must be 'low'|'medium'|'high'."
-    )
-    user = text
-    payload = {
-        "model": settings.OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.2,
-    }
-    headers = {
-        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post("https://api.openai.com/v1/chat/completions",
-                                     headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            return AIResult(**parsed)
-    except Exception as e:
-        # Fall back silently to rule-based
-        return None
-
-# -----------------------------
-# Actions
-# -----------------------------
-def send_email(subject: str, body: str, to: Optional[str] = None):
-    to_addr = to or settings.EMAIL_TO_DEFAULT
-    if not to_addr:
-        raise RuntimeError("EMAIL_TO_DEFAULT not set and no 'to' provided.")
-
-    msg = MIMEText(body, "plain")
-    msg["Subject"] = subject
-    msg["From"] = settings.SMTP_USER
-    msg["To"] = to_addr
-
-    with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
-        server.starttls()
-        server.login(settings.SMTP_USER, settings.SMTP_PASS)
-        server.sendmail(settings.SMTP_USER, [to_addr], msg.as_string())
-
-async def create_monday_item(item_name: str, column_values: dict):
-    if not settings.MONDAY_API_TOKEN or not settings.MONDAY_BOARD_ID:
-        raise RuntimeError("Missing MONDAY_API_TOKEN or MONDAY_BOARD_ID")
-    query = """
-    mutation ($board_id: Int!, $group_id: String, $item_name: String!, $column_values: JSON) {
-      create_item (board_id: $board_id, group_id: $group_id, item_name: $item_name, column_values: $column_values) {
-        id
-        name
-      }
-    }
-    """
-    variables = {
-        "board_id": settings.MONDAY_BOARD_ID,
-        "group_id": settings.MONDAY_GROUP_ID,
-        "item_name": item_name,
-        "column_values": json.dumps(column_values) if column_values else None,
-    }
-    headers = {
-        "Authorization": settings.MONDAY_API_TOKEN,
-        "Content-Type": "application/json",
-    }
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post("https://api.monday.com/v2",
-                              headers=headers, json={"query": query, "variables": variables})
-        r.raise_for_status()
-        return r.json()
-
-# -----------------------------
-# FastAPI app
-# -----------------------------
-app = FastAPI(title="Makeflow-Python", version="1.0.0")
+app = FastAPI(title="Makeflow-Python (New Tickets Only)")
 
 @app.get("/")
 def health():
     return {"status": "ok"}
 
+# --------- Monday helpers ----------
+async def monday_create_item(item_name: str, column_values: Dict[str, Any]) -> Dict[str, Any]:
+    query = """
+    mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $columnVals: JSON!) {
+      create_item(
+        board_id: $boardId,
+        group_id: $groupId,
+        item_name: $itemName,
+        column_values: $columnVals
+      ) { id name }
+    }
+    """
+    variables = {
+        "boardId": MONDAY_BOARD_ID,
+        "groupId": MONDAY_GROUP_NEW,
+        "itemName": item_name,
+        "columnVals": json.dumps(column_values),
+    }
+    headers = {"Authorization": MONDAY_API_TOKEN, "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post("https://api.monday.com/v2", headers=headers, json={"query": query, "variables": variables})
+        r.raise_for_status()
+        data = r.json()
+        # Bubble up GraphQL errors cleanly
+        if "errors" in data:
+            raise HTTPException(status_code=502, detail=data["errors"])
+        return data
+
+# --------- Webhook (Google Form -> here) ----------
 @app.post("/webhook")
-async def webhook(payload: Incoming):
-    text = payload.message or ""
-    # Try LLM first (if configured), else rule-based
-    ai = await classify_with_llm(text)
-    if ai is None:
-        ai = classify_rule_based(text)
+async def webhook(
+    request: Request,
+    x_forms_secret: Optional[str] = Header(None)
+):
+    if x_forms_secret != FORMS_SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="bad secret")
 
-    if ai.intent == "clarify":
-        subject = payload.subject or f"[Clarify Needed] {ai.summary[:60]}"
-        body = f"""We need clarification on the request.
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
 
-Reason: {ai.reason}
-Priority: {ai.priority}
+    # Normalize incoming fields
+    description    = (payload.get("description") or "").strip()
+    categoria      = (payload.get("categoria") or "").strip().upper()
+    priorita       = (payload.get("priorita")  or "").strip().upper()
+    reporter_email = (payload.get("email")     or "").strip()
+    attachments    = payload.get("attachments") or []           # not used unless you add a column
+    link_of_record = (payload.get("link_of_record") or "").strip()
 
-Sender: {payload.sender or 'unknown'}
-Subject: {payload.subject or '(none)'}
-Message:
-{payload.message}
-"""
-        try:
-            send_email(subject, body)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Email failed: {e}")
-        return {"routed_to": "email", "ai": ai.model_dump()}
+    if not description:
+        raise HTTPException(status_code=400, detail="description is required")
 
-    else:  # create
-        item_name = payload.subject or ai.summary[:80]
-        column_values = {
-            "text": ai.summary,
-            "status": {"label": ai.priority.capitalize()},
-            "email": {"email": payload.sender or "", "text": payload.sender or ""},
-        }
-        try:
-            result = await create_monday_item(item_name, column_values)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Monday.com failed: {e}")
-        return {"routed_to": "monday.com", "api_result": result, "ai": ai.model_dump()}
+    # Item title: keep short and useful
+    item_name = (description[:30] + "…") if len(description) > 30 else description or "Richiesta"
+
+    # Build Monday column values
+    column_values: Dict[str, Any] = {
+        COL_DESCRIPTION: description,
+        COL_EMAIL: {"email": reporter_email, "text": reporter_email} if reporter_email else {"email": "", "text": ""},
+        COL_CATEGORY: {"label": categoria} if categoria else None,
+        COL_PRIORITY: {"label": priorita} if priorita else None,
+    }
+    # Remove Nones (GraphQL chokes on them)
+    column_values = {k: v for k, v in column_values.items() if v is not None}
+
+    # NOTE: if you also want to set "Link of the record" in a Link/Text column,
+    # add its column ID as env and include here, e.g.:
+    # COL_LINK = os.getenv("MONDAY_COLUMN_LINK_OF_RECORD")
+    # if link_of_record and COL_LINK:
+    #     column_values[COL_LINK] = {"url": link_of_record, "text": "Record"}
+
+    result = await monday_create_item(item_name=item_name, column_values=column_values)
+    return {"ok": True, "created": result}
