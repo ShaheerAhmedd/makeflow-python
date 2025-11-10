@@ -1,0 +1,193 @@
+#PythonConvLine
+#!/usr/bin/env python3
+import os, sys, json, hashlib
+from datetime import datetime, timedelta, timezone
+import pandas as pd
+import requests
+from urllib.parse import urlparse, urlunparse
+
+# ================== ENV / CONFIG ==================
+VTIGER_URL        = os.getenv("VTIGER_URL", "https://URL.aessefin.it/").strip()
+VTIGER_USER       = os.getenv("VTIGER_USER", "User").strip()
+VTIGER_ACCESS_KEY = os.getenv("VTIGER_ACCESS_KEY", "Access_Key").strip()
+
+WEBAPP_URL        = os.getenv("GS_WEBAPP_URL", "https://script.google.com/macros/s/SHEET_CODE/exec").strip()   # Apps Script /exec URL
+WEBAPP_TOKEN      = os.getenv("GS_SHARED_SECRET", "WEB_TOKEN").strip()
+
+MODULE = "Contacts"
+FIXED_FROM = "2025-01-01"
+DAYS_BACK  = 63
+LIMIT      = 100
+
+LIQUIDATION_LABEL   = "Data Liquidazione"
+CREATED_LEAD_LABEL  = "Data creazione Leads Originaria"
+COMM_ACTIVE_LABEL   = "Commissioni Attive Totali"   # for Conversion Value
+
+TARGET_COLUMNS = [
+    "Email",
+    "Phone Number",
+    "Conversion Name",
+    "Conversion Time",
+    "Conversion Value",
+    "Conversion Currency",
+    "Ad User Data",
+    "Ad Personalization",
+]
+
+# ================== VTIGER HELPERS ==================
+S = requests.Session()
+S.headers.update({"User-Agent":"vtiger->gsheets/1.0","Accept":"application/json"})
+
+def api_url(url: str) -> str:
+    u = urlparse(url)
+    base = u.netloc or u.path
+    if not base:
+        raise SystemExit("Invalid VTIGER_URL")
+    return urlunparse((u.scheme or "https", base, "/webservice.php", "", "", ""))
+
+API = api_url(VTIGER_URL)
+
+def j(r):
+    try:
+        return r.json()
+    except Exception:
+        raise SystemExit(f"Non-JSON response: {r.status_code} {r.text[:200]}")
+
+def vt_login(user, access_key):
+    r = S.get(API, params={"operation":"getchallenge", "username":user}, timeout=30); r.raise_for_status()
+    token = j(r)["result"]["token"]
+    key = hashlib.md5((token + access_key).encode("utf-8")).hexdigest()
+    r2 = S.post(API, data={"operation":"login","username":user,"accessKey":key}, timeout=30); r2.raise_for_status()
+    out = j(r2)
+    if not out.get("success"):
+        raise SystemExit(f"login failed: {out}")
+    S.params = {"sessionName": out["result"]["sessionName"]}
+
+def vt_describe(module):
+    r = S.get(API, params={"operation":"describe","elementType":module}, timeout=30); r.raise_for_status()
+    out = j(r)
+    if not out.get("success"):
+        raise SystemExit(f"describe failed: {out}")
+    return out["result"]
+
+def label_to_name(desc, label):
+    tgt = label.strip().lower()
+    for f in desc["fields"]:
+        if f.get("label","").strip().lower() == tgt:
+            return f["name"]
+    for f in desc["fields"]:
+        if tgt in f.get("label","").strip().lower():
+            return f["name"]
+    raise SystemExit(f"Field with label '{label}' not found in module describe.")
+
+def vt_query(query):
+    r = S.get(API, params={"operation":"query","query":query}, timeout=60); r.raise_for_status()
+    out = j(r)
+    if not out.get("success"):
+        raise SystemExit(f"query failed: {out}")
+    return out["result"]
+
+# ================== SHEET POST ==================
+def push_df_to_sheet(df: pd.DataFrame):
+    if not WEBAPP_URL or not WEBAPP_TOKEN:
+        raise SystemExit("Missing GS_WEBAPP_URL / GS_SHARED_SECRET")
+
+    rows = df.astype(str).fillna("").values.tolist()
+    resp = requests.post(
+        WEBAPP_URL,
+        params={"token": WEBAPP_TOKEN},                  # Apps Script clears A2:Z then writes
+        headers={"Content-Type":"application/json"},
+        data=json.dumps({"rows": rows}),
+        timeout=60,
+    )
+    resp.raise_for_status()
+    print(resp.text)
+
+# ================== MAIN ==================
+def main():
+    if not (VTIGER_USER and VTIGER_ACCESS_KEY):
+        raise SystemExit("Missing VTIGER_USER / VTIGER_ACCESS_KEY")
+
+    vt_login(VTIGER_USER, VTIGER_ACCESS_KEY)
+    desc = vt_describe(MODULE)
+
+    # Resolve API names for the labels we care about
+    liquidation = label_to_name(desc, LIQUIDATION_LABEL)
+    created_lead = label_to_name(desc, CREATED_LEAD_LABEL)
+    comm_active  = label_to_name(desc, COMM_ACTIVE_LABEL)
+
+    minus_63 = (datetime.now(timezone.utc) - timedelta(days=DAYS_BACK)).date().isoformat()
+
+    query = (
+        f"select * from {MODULE} "
+        f"where {liquidation} >= '{FIXED_FROM}' "
+        f"and {created_lead} >= '{minus_63}' "
+        f"limit 0,{LIMIT};"
+    )
+    data = vt_query(query)
+
+    # Build the exact 8-column DataFrame for the sheet
+    if not data:
+        out = pd.DataFrame(columns=TARGET_COLUMNS)
+        push_df_to_sheet(out)
+        return
+
+    df = pd.json_normalize(data)
+
+    def pick(*names, default=""):
+        for n in names:
+            if n in df.columns:
+                return df[n]
+        return pd.Series([default] * len(df))
+
+    # Email / Phone
+    email_series = pick("email", "email1", "email2", default="")
+    phone_series = pick("mobile", "phone", default="")
+
+    # Conversion Name (constant)
+    conv_name = pd.Series(["Liquidata Stato 60"] * len(df))
+
+    # Conversion Time from Data Liquidazione → "YYYY-MM-DD 00:00:00", else default
+    def fmt_time(val):
+        s = (str(val) if val is not None else "").strip()
+        if len(s) >= 10:
+            return s[:10] + " 00:00:00"
+        return "2025-01-01 00:00:00"
+
+    conv_time = pick(liquidation, default="").map(fmt_time)
+
+    # Conversion Value from Commissioni Attive Totali → two decimals; if 0/blank/invalid → 1000
+    def to_money(v):
+        s = str(v).strip()
+        if s in ("", "None", "nan", "NaN"):
+            return "1000"
+        try:
+            x = float(s.replace(",", "."))
+        except ValueError:
+            return "1000"
+        if x <= 0:
+            return "1000"
+        return f"{x:.2f}"
+
+    conv_value = pick(comm_active, default="").map(to_money)
+
+    # Constant fields
+    conv_currency = pd.Series(["EUR"] * len(df))
+    ad_user_data  = pd.Series(["GRANTED"] * len(df))
+    ad_personal   = pd.Series(["GRANTED"] * len(df))
+
+    out = pd.DataFrame({
+        "Email": email_series.astype(str).fillna(""),
+        "Phone Number": phone_series.astype(str).fillna(""),
+        "Conversion Name": conv_name,
+        "Conversion Time": conv_time,
+        "Conversion Value": conv_value,
+        "Conversion Currency": conv_currency,
+        "Ad User Data": ad_user_data,
+        "Ad Personalization": ad_personal,
+    })[TARGET_COLUMNS]
+
+    push_df_to_sheet(out)
+
+if __name__ == "__main__":
+    main()
